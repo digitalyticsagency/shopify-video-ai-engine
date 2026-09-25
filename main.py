@@ -46,6 +46,14 @@ class GenerationSummary(BaseModel):
     results: list[VideoResult]
 
 
+class ProductSummary(BaseModel):
+    id: str
+    title: str
+    price: str
+    currency_code: str
+    image_url: str | None = None
+
+
 def _process_product(client_products: list[ShopifyProduct]) -> GenerationSummary:
     orchestrator = AIOrchestrator()
     results: list[VideoResult] = []
@@ -80,12 +88,15 @@ def _process_product(client_products: list[ShopifyProduct]) -> GenerationSummary
     return summary
 
 
-async def run_daily_video_generation() -> GenerationSummary:
-    """Fetch top Shopify products and render a promo video for each one."""
+async def run_daily_video_generation(product_ids: list[str] | None = None) -> GenerationSummary:
+    """Render a promo video for each given product, or the top 3 most recently updated if none given."""
     shopify_client = ShopifyClient()
 
     try:
-        products = await shopify_client.fetch_top_products(count=3)
+        if product_ids:
+            products = await shopify_client.fetch_products_by_ids(product_ids)
+        else:
+            products = await shopify_client.fetch_top_products(count=3)
     except ShopifyClientError as exc:
         logger.error("Shopify fetch failed: %s", exc)
         raise
@@ -111,9 +122,70 @@ async def status() -> dict:
         "service": "Shopify Video AI Engine",
         "status": "running",
         "gemini_api_key_configured": runtime_settings.has_gemini_api_key(),
+        "shopify_configured": runtime_settings.has_shopify_credentials(),
         "runs_completed": len(_run_history),
         "last_run": _run_history[-1] if _run_history else None,
     }
+
+
+class ShopifyCredentialsUpdate(BaseModel):
+    store_url: str = Field(..., min_length=1)
+    access_token: str = Field(..., min_length=1)
+
+
+class ShopifyStatus(BaseModel):
+    shopify_configured: bool
+    store_url: str | None = None
+
+
+@app.get("/api/settings/shopify", response_model=ShopifyStatus)
+async def get_shopify_status() -> ShopifyStatus:
+    """Report whether Shopify credentials are configured (store URL only, never the token)."""
+    return ShopifyStatus(
+        shopify_configured=runtime_settings.has_shopify_credentials(),
+        store_url=runtime_settings.get_shopify_store_url(),
+    )
+
+
+@app.post("/api/settings/shopify", response_model=ShopifyStatus)
+async def set_shopify_credentials(payload: ShopifyCredentialsUpdate) -> ShopifyStatus:
+    """Connect a Shopify store: store URL + Admin API access token, in memory, for this process."""
+    runtime_settings.set_shopify_credentials(payload.store_url, payload.access_token)
+    return ShopifyStatus(
+        shopify_configured=runtime_settings.has_shopify_credentials(),
+        store_url=runtime_settings.get_shopify_store_url(),
+    )
+
+
+@app.delete("/api/settings/shopify", response_model=ShopifyStatus)
+async def clear_shopify_credentials() -> ShopifyStatus:
+    """Disconnect the Shopify store (falls back to .env values, if set)."""
+    runtime_settings.clear_shopify_credentials()
+    return ShopifyStatus(
+        shopify_configured=runtime_settings.has_shopify_credentials(),
+        store_url=runtime_settings.get_shopify_store_url(),
+    )
+
+
+@app.get("/api/products", response_model=list[ProductSummary])
+async def list_products() -> list[ProductSummary]:
+    """List recent products from the connected Shopify store, for picking which ones to render."""
+    try:
+        shopify_client = ShopifyClient()
+        products = await shopify_client.fetch_products(count=20)
+    except ShopifyClientError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return [
+        ProductSummary(
+            id=p.id,
+            title=p.title,
+            price=p.price,
+            currency_code=p.currency_code,
+            image_url=p.image_urls[0] if p.image_urls else None,
+        )
+        for p in products
+    ]
 
 
 class GeminiKeyUpdate(BaseModel):
@@ -224,7 +296,7 @@ _BASE_STYLE = """
     padding: 20px;
     margin-bottom: 20px;
   }
-  .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px; }
+  .stat-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; margin-bottom: 20px; }
   .stat-card {
     background: var(--color-muted);
     border: 1px solid var(--color-border);
@@ -285,6 +357,22 @@ _BASE_STYLE = """
   .ok { color: var(--color-success); }
   .err { color: var(--color-destructive); }
   video.preview { width: 100%; max-width: 220px; border-radius: var(--radius); margin-top: 6px; display: block; }
+  .divider { border: none; border-top: 1px solid var(--color-border); margin: 18px 0; }
+  .product-picker { display: flex; flex-direction: column; gap: 2px; max-height: 340px; overflow-y: auto; margin: 4px 0 16px; }
+  .product-row-select {
+    display: flex; align-items: center; gap: 12px; padding: 8px 6px; border-radius: 8px; cursor: pointer;
+  }
+  .product-row-select:hover { background: var(--color-background); }
+  .product-row-select input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--color-primary); cursor: pointer; }
+  .product-thumb {
+    width: 36px; height: 36px; border-radius: 6px; object-fit: cover; background: var(--color-border); flex-shrink: 0;
+  }
+  .product-row-select .product-name { flex: 1; font-size: 13px; }
+  .product-row-select .product-price { font-family: 'Fira Code', monospace; font-size: 12px; color: var(--color-muted-foreground); }
+  .link-btn {
+    background: none; border: none; padding: 0; color: var(--color-primary); font-family: inherit; font-size: 13px;
+    font-weight: 600; cursor: pointer; text-decoration: underline;
+  }
   @media (max-width: 640px) {
     .stat-grid { grid-template-columns: 1fr; }
     main { padding: 24px 16px 60px; }
@@ -313,6 +401,11 @@ _ICON_GEAR = (
     '<path stroke-linecap="round" d="M10 3.5v1.8M10 14.7v1.8M16.5 10h-1.8M5.3 10H3.5'
     'M14.8 5.2l-1.3 1.3M6.5 13.5l-1.3 1.3M14.8 14.8l-1.3-1.3M6.5 6.5L5.2 5.2" /></svg>'
 )
+_ICON_STORE = (
+    '<svg class="icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2">'
+    '<path stroke-linecap="round" stroke-linejoin="round" d="M4 6l6-3 6 3v8l-6 3-6-3V6z" />'
+    '<path stroke-linecap="round" stroke-linejoin="round" d="M4 6l6 3 6-3M10 9v8" /></svg>'
+)
 _ICON_HOME = (
     '<svg class="icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2">'
     '<path stroke-linecap="round" stroke-linejoin="round" d="M3.5 9.5L10 4l6.5 5.5" />'
@@ -336,7 +429,7 @@ _NAV = f"""
 
 @app.get("/settings", response_class=HTMLResponse)
 async def settings_page() -> str:
-    """A page to enter the Gemini API key without editing .env or restarting the server."""
+    """Connect the Shopify store and set the Gemini API key, without editing .env or restarting."""
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -349,13 +442,32 @@ async def settings_page() -> str:
 <body>
 {_NAV}
 <main>
-  <h1>Gemini API key</h1>
-  <p class="subtitle">
-    Used to generate the 3-scene video script for each product. Stored in memory only
-    (never written to disk); falls back to <code>GEMINI_API_KEY</code> in <code>.env</code> if unset.
-  </p>
+  <h1>Settings</h1>
+  <p class="subtitle">Connect your Shopify store and Gemini API key. Both are kept in server memory only, never written to disk; either falls back to its .env value if unset here.</p>
 
   <div class="card">
+    <h2>{_ICON_STORE} Shopify store</h2>
+    <div id="shopify-current-status" class="stat-value" style="margin-bottom: 18px; font-size: 14px;"></div>
+
+    <label for="shop-url">Store URL</label>
+    <input type="text" id="shop-url" placeholder="your-shop.myshopify.com" autocomplete="off" style="margin-bottom: 14px;">
+
+    <label for="shop-token">Admin API access token</label>
+    <input type="password" id="shop-token" placeholder="shpat_..." autocomplete="off">
+    <p class="subtitle" style="margin: 8px 0 0; font-size: 12px;">
+      From your Shopify admin: Settings → Apps and sales channels → Develop apps → your app →
+      API credentials → Admin API access token.
+    </p>
+    <div style="margin-top: 14px;">
+      <button id="shopify-save-btn">Connect store</button>
+      <button id="shopify-clear-btn" class="secondary">Disconnect</button>
+    </div>
+    <div id="shopify-status-msg"></div>
+  </div>
+
+  <div class="card">
+    <h2>Gemini API key</h2>
+    <p class="subtitle">Used to generate the 3-scene video script for each product.</p>
     <div id="current-status" class="stat-value" style="margin-bottom: 18px; font-size: 14px;"></div>
 
     <label for="api-key">Gemini API key</label>
@@ -369,10 +481,60 @@ async def settings_page() -> str:
 </main>
 
 <script>
+  const checkIcon = '{_ICON_CHECK}';
+
+  // Shopify store
+  const shopUrlInput = document.getElementById('shop-url');
+  const shopTokenInput = document.getElementById('shop-token');
+  const shopifyStatusEl = document.getElementById('shopify-current-status');
+  const shopifyStatusMsg = document.getElementById('shopify-status-msg');
+
+  async function refreshShopifyStatus() {{
+    const res = await fetch('/api/settings/shopify');
+    const data = await res.json();
+    shopifyStatusEl.innerHTML = data.shopify_configured
+      ? checkIcon + ' <span style="color: var(--color-success);">Connected to ' + data.store_url + '</span>'
+      : '<span style="color: var(--color-muted-foreground);">No Shopify store connected yet</span>';
+  }}
+
+  document.getElementById('shopify-save-btn').addEventListener('click', async () => {{
+    const storeUrl = shopUrlInput.value.trim();
+    const accessToken = shopTokenInput.value.trim();
+    if (!storeUrl || !accessToken) {{
+      shopifyStatusMsg.textContent = 'Enter both the store URL and access token.';
+      shopifyStatusMsg.className = 'err';
+      return;
+    }}
+    const res = await fetch('/api/settings/shopify', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ store_url: storeUrl, access_token: accessToken }}),
+    }});
+    if (res.ok) {{
+      shopifyStatusMsg.textContent = 'Connected.';
+      shopifyStatusMsg.className = 'ok';
+      shopUrlInput.value = '';
+      shopTokenInput.value = '';
+      refreshShopifyStatus();
+    }} else {{
+      shopifyStatusMsg.textContent = 'Failed to connect.';
+      shopifyStatusMsg.className = 'err';
+    }}
+  }});
+
+  document.getElementById('shopify-clear-btn').addEventListener('click', async () => {{
+    await fetch('/api/settings/shopify', {{ method: 'DELETE' }});
+    shopifyStatusMsg.textContent = 'Disconnected.';
+    shopifyStatusMsg.className = 'ok';
+    refreshShopifyStatus();
+  }});
+
+  refreshShopifyStatus();
+
+  // Gemini key
   const statusMsg = document.getElementById('status-msg');
   const currentStatusEl = document.getElementById('current-status');
   const input = document.getElementById('api-key');
-  const checkIcon = '{_ICON_CHECK}';
 
   async function refreshStatus() {{
     const res = await fetch('/api/settings');
@@ -438,6 +600,10 @@ async def dashboard() -> str:
 
   <div class="stat-grid">
     <div class="stat-card">
+      <div class="stat-label">Shopify store</div>
+      <div class="stat-value" id="shopify-status">—</div>
+    </div>
+    <div class="stat-card">
       <div class="stat-label">Gemini API key</div>
       <div class="stat-value" id="key-status">—</div>
     </div>
@@ -448,11 +614,19 @@ async def dashboard() -> str:
   </div>
 
   <div class="card">
-    <h2>Generate today's videos</h2>
+    <h2>Generate videos</h2>
     <p class="subtitle" style="margin-bottom: 16px;">
       Pulls your 3 most recently updated products, writes a script with Gemini, and renders each video.
     </p>
     <button id="generate-btn">Generate daily videos</button>
+    <button id="load-products-btn" class="link-btn" style="margin-left: 16px;">Or choose specific products</button>
+
+    <div id="product-picker-wrap" hidden>
+      <hr class="divider">
+      <div id="product-picker" class="product-picker"><div class="empty-state">Loading products…</div></div>
+      <button id="generate-selected-btn">Generate selected</button>
+    </div>
+
     <div id="status-msg"></div>
   </div>
 
@@ -465,12 +639,18 @@ async def dashboard() -> str:
 <script>
   const checkIcon = '{_ICON_CHECK}';
   const keyIcon = '{_ICON_KEY}';
+  const storeIcon = '{_ICON_STORE}';
   const clockIcon = '{_ICON_CLOCK}';
+  const shopifyStatusEl = document.getElementById('shopify-status');
   const keyStatusEl = document.getElementById('key-status');
   const runsCountEl = document.getElementById('runs-count');
   const runsListEl = document.getElementById('runs-list');
   const statusMsg = document.getElementById('status-msg');
   const generateBtn = document.getElementById('generate-btn');
+  const loadProductsBtn = document.getElementById('load-products-btn');
+  const productPickerWrap = document.getElementById('product-picker-wrap');
+  const productPickerEl = document.getElementById('product-picker');
+  const generateSelectedBtn = document.getElementById('generate-selected-btn');
 
   function escapeHtml(str) {{
     const div = document.createElement('div');
@@ -504,6 +684,9 @@ async def dashboard() -> str:
     keyStatusEl.innerHTML = data.gemini_api_key_configured
       ? checkIcon + ' <span style="color: var(--color-success);">Configured</span>'
       : keyIcon + ' <a href="/settings" style="font-size:14px;">Set key</a>';
+    shopifyStatusEl.innerHTML = data.shopify_configured
+      ? checkIcon + ' <span style="color: var(--color-success);">Connected</span>'
+      : storeIcon + ' <a href="/settings" style="font-size:14px;">Connect store</a>';
     runsCountEl.textContent = data.runs_completed;
   }}
 
@@ -517,13 +700,17 @@ async def dashboard() -> str:
     runsListEl.innerHTML = runs.slice().reverse().map(renderRun).join('');
   }}
 
-  generateBtn.addEventListener('click', async () => {{
-    generateBtn.disabled = true;
-    generateBtn.textContent = 'Generating…';
+  async function runGeneration(productIds, triggerBtn, triggerLabel) {{
+    triggerBtn.disabled = true;
+    triggerBtn.textContent = 'Generating…';
     statusMsg.className = '';
     statusMsg.textContent = 'Fetching products, writing scripts, rendering video — this can take a minute.';
     try {{
-      const res = await fetch('/api/generate-daily-videos', {{ method: 'POST' }});
+      const res = await fetch('/api/generate-daily-videos', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ product_ids: productIds }}),
+      }});
       const data = await res.json();
       if (res.ok) {{
         statusMsg.className = 'ok';
@@ -538,9 +725,51 @@ async def dashboard() -> str:
       statusMsg.className = 'err';
       statusMsg.textContent = 'Request failed: ' + e;
     }} finally {{
-      generateBtn.disabled = false;
-      generateBtn.textContent = 'Generate daily videos';
+      triggerBtn.disabled = false;
+      triggerBtn.textContent = triggerLabel;
     }}
+  }}
+
+  generateBtn.addEventListener('click', () => runGeneration(null, generateBtn, 'Generate daily videos'));
+
+  loadProductsBtn.addEventListener('click', async () => {{
+    productPickerWrap.hidden = false;
+    productPickerEl.innerHTML = '<div class="empty-state">Loading products…</div>';
+    try {{
+      const res = await fetch('/api/products');
+      const data = await res.json();
+      if (!res.ok) {{
+        productPickerEl.innerHTML = '<div class="empty-state">' + escapeHtml(data.detail || 'Could not load products.') + '</div>';
+        return;
+      }}
+      if (data.length === 0) {{
+        productPickerEl.innerHTML = '<div class="empty-state">No products found in this store.</div>';
+        return;
+      }}
+      productPickerEl.innerHTML = data.map(p => {{
+        const thumb = p.image_url
+          ? '<img class="product-thumb" src="' + p.image_url + '" alt="">'
+          : '<div class="product-thumb"></div>';
+        return '<label class="product-row-select">' +
+          '<input type="checkbox" value="' + p.id + '">' +
+          thumb +
+          '<span class="product-name">' + escapeHtml(p.title) + '</span>' +
+          '<span class="product-price">' + escapeHtml(p.price) + ' ' + escapeHtml(p.currency_code) + '</span>' +
+        '</label>';
+      }}).join('');
+    }} catch (e) {{
+      productPickerEl.innerHTML = '<div class="empty-state">Request failed: ' + escapeHtml(String(e)) + '</div>';
+    }}
+  }});
+
+  generateSelectedBtn.addEventListener('click', () => {{
+    const ids = Array.from(productPickerEl.querySelectorAll('input[type="checkbox"]:checked')).map(cb => cb.value);
+    if (ids.length === 0) {{
+      statusMsg.className = 'err';
+      statusMsg.textContent = 'Select at least one product first.';
+      return;
+    }}
+    runGeneration(ids, generateSelectedBtn, 'Generate selected');
   }});
 
   refreshStatus();
@@ -550,15 +779,25 @@ async def dashboard() -> str:
 </html>"""
 
 
+class GenerateRequest(BaseModel):
+    product_ids: list[str] | None = None
+
+
 @app.post("/api/generate-daily-videos", response_model=GenerationSummary)
-async def generate_daily_videos(background_tasks: BackgroundTasks) -> GenerationSummary:
-    """Trigger the daily video generation pipeline synchronously for immediate feedback.
+async def generate_daily_videos(
+    background_tasks: BackgroundTasks, payload: GenerateRequest | None = None
+) -> GenerationSummary:
+    """Trigger video generation synchronously for immediate feedback.
+
+    With no body (or an empty product_ids), renders the top 3 most recently updated products.
+    With product_ids set, renders exactly those products instead.
 
     A background task also records the run so repeated automated triggers (e.g. a scheduler)
     do not block on the full render before returning a response.
     """
+    product_ids = payload.product_ids if payload else None
     try:
-        summary = await run_daily_video_generation()
+        summary = await run_daily_video_generation(product_ids)
     except ShopifyClientError as exc:
         raise HTTPException(status_code=502, detail=f"Shopify API error: {exc}") from exc
     except Exception as exc:  # noqa: BLE001 - surface unexpected failures as a 500
