@@ -3,15 +3,17 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import runtime_settings
+import shopify_oauth
 from ai_orchestrator import AIOrchestrationError, AIOrchestrator
 from config import settings
 from shopify_client import ShopifyClient, ShopifyClientError, ShopifyProduct
+from shopify_oauth import ShopifyOAuthError
 from video_engine import VideoRenderError, render_product_video
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -136,35 +138,77 @@ class ShopifyCredentialsUpdate(BaseModel):
 class ShopifyStatus(BaseModel):
     shopify_configured: bool
     store_url: str | None = None
+    oauth_available: bool = False
+
+
+def _shopify_status() -> ShopifyStatus:
+    return ShopifyStatus(
+        shopify_configured=runtime_settings.has_shopify_credentials(),
+        store_url=runtime_settings.get_shopify_store_url(),
+        oauth_available=shopify_oauth.is_configured(),
+    )
 
 
 @app.get("/api/settings/shopify", response_model=ShopifyStatus)
 async def get_shopify_status() -> ShopifyStatus:
     """Report whether Shopify credentials are configured (store URL only, never the token)."""
-    return ShopifyStatus(
-        shopify_configured=runtime_settings.has_shopify_credentials(),
-        store_url=runtime_settings.get_shopify_store_url(),
-    )
+    return _shopify_status()
 
 
 @app.post("/api/settings/shopify", response_model=ShopifyStatus)
 async def set_shopify_credentials(payload: ShopifyCredentialsUpdate) -> ShopifyStatus:
     """Connect a Shopify store: store URL + Admin API access token, in memory, for this process."""
     runtime_settings.set_shopify_credentials(payload.store_url, payload.access_token)
-    return ShopifyStatus(
-        shopify_configured=runtime_settings.has_shopify_credentials(),
-        store_url=runtime_settings.get_shopify_store_url(),
-    )
+    return _shopify_status()
 
 
 @app.delete("/api/settings/shopify", response_model=ShopifyStatus)
 async def clear_shopify_credentials() -> ShopifyStatus:
     """Disconnect the Shopify store (falls back to .env values, if set)."""
     runtime_settings.clear_shopify_credentials()
-    return ShopifyStatus(
-        shopify_configured=runtime_settings.has_shopify_credentials(),
-        store_url=runtime_settings.get_shopify_store_url(),
-    )
+    return _shopify_status()
+
+
+@app.get("/auth/shopify/install")
+async def shopify_oauth_install(shop: str) -> RedirectResponse:
+    """Start the OAuth flow: redirect the merchant to Shopify's own authorize screen."""
+    try:
+        validated_shop = shopify_oauth.validate_shop_domain(shop)
+        state = shopify_oauth.generate_state()
+        authorize_url = shopify_oauth.build_authorize_url(validated_shop, state)
+    except ShopifyOAuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return RedirectResponse(authorize_url)
+
+
+@app.get("/auth/shopify/callback")
+async def shopify_oauth_callback(request: Request) -> RedirectResponse:
+    """Handle Shopify's redirect back: verify it, exchange the code, save the access token."""
+    params = dict(request.query_params)
+    shop = params.get("shop", "")
+    state = params.get("state", "")
+    code = params.get("code", "")
+
+    try:
+        validated_shop = shopify_oauth.validate_shop_domain(shop)
+    except ShopifyOAuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if not shopify_oauth.consume_state(state):
+        raise HTTPException(status_code=400, detail="Invalid or expired OAuth state.")
+    if not shopify_oauth.verify_hmac(params):
+        raise HTTPException(status_code=400, detail="Shopify callback signature verification failed.")
+    if not code:
+        raise HTTPException(status_code=400, detail="Missing authorization code.")
+
+    try:
+        access_token = await shopify_oauth.exchange_code_for_token(validated_shop, code)
+    except ShopifyOAuthError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    runtime_settings.set_shopify_credentials(validated_shop, access_token)
+    logger.info("Shopify OAuth connected: %s", validated_shop)
+    return RedirectResponse("/settings?connected=shopify")
 
 
 @app.get("/api/products", response_model=list[ProductSummary])
@@ -449,19 +493,35 @@ async def settings_page() -> str:
     <h2>{_ICON_STORE} Shopify store</h2>
     <div id="shopify-current-status" class="stat-value" style="margin-bottom: 18px; font-size: 14px;"></div>
 
-    <label for="shop-url">Store URL</label>
-    <input type="text" id="shop-url" placeholder="your-shop.myshopify.com" autocomplete="off" style="margin-bottom: 14px;">
-
-    <label for="shop-token">Admin API access token</label>
-    <input type="password" id="shop-token" placeholder="shpat_..." autocomplete="off">
-    <p class="subtitle" style="margin: 8px 0 0; font-size: 12px;">
-      From your Shopify admin: Settings → Apps and sales channels → Develop apps → your app →
-      API credentials → Admin API access token.
-    </p>
-    <div style="margin-top: 14px;">
-      <button id="shopify-save-btn">Connect store</button>
-      <button id="shopify-clear-btn" class="secondary">Disconnect</button>
+    <div id="oauth-block" hidden>
+      <label for="oauth-shop">Store domain</label>
+      <input type="text" id="oauth-shop" placeholder="your-shop.myshopify.com" autocomplete="off">
+      <div style="margin-top: 14px;">
+        <button id="oauth-connect-btn">Connect with Shopify</button>
+      </div>
+      <p class="subtitle" style="margin: 10px 0 0; font-size: 12px;">
+        Redirects to Shopify's own login — you approve the requested access there, no token copy-paste.
+      </p>
+      <hr class="divider">
+      <button id="show-manual-btn" class="link-btn">Or paste an access token directly</button>
     </div>
+
+    <div id="manual-block" hidden>
+      <label for="shop-url">Store URL</label>
+      <input type="text" id="shop-url" placeholder="your-shop.myshopify.com" autocomplete="off" style="margin-bottom: 14px;">
+
+      <label for="shop-token">Admin API access token</label>
+      <input type="password" id="shop-token" placeholder="shpat_..." autocomplete="off">
+      <p class="subtitle" style="margin: 8px 0 0; font-size: 12px;">
+        From your Shopify admin: Settings → Apps and sales channels → Develop apps → your app →
+        API credentials → Admin API access token.
+      </p>
+      <div style="margin-top: 14px;">
+        <button id="shopify-save-btn">Connect store</button>
+        <button id="shopify-clear-btn" class="secondary">Disconnect</button>
+      </div>
+    </div>
+
     <div id="shopify-status-msg"></div>
   </div>
 
@@ -484,10 +544,18 @@ async def settings_page() -> str:
   const checkIcon = '{_ICON_CHECK}';
 
   // Shopify store
+  const oauthBlock = document.getElementById('oauth-block');
+  const manualBlock = document.getElementById('manual-block');
+  const oauthShopInput = document.getElementById('oauth-shop');
   const shopUrlInput = document.getElementById('shop-url');
   const shopTokenInput = document.getElementById('shop-token');
   const shopifyStatusEl = document.getElementById('shopify-current-status');
   const shopifyStatusMsg = document.getElementById('shopify-status-msg');
+
+  if (new URLSearchParams(location.search).get('connected') === 'shopify') {{
+    shopifyStatusMsg.textContent = 'Connected via Shopify.';
+    shopifyStatusMsg.className = 'ok';
+  }}
 
   async function refreshShopifyStatus() {{
     const res = await fetch('/api/settings/shopify');
@@ -495,7 +563,30 @@ async def settings_page() -> str:
     shopifyStatusEl.innerHTML = data.shopify_configured
       ? checkIcon + ' <span style="color: var(--color-success);">Connected to ' + data.store_url + '</span>'
       : '<span style="color: var(--color-muted-foreground);">No Shopify store connected yet</span>';
+
+    if (data.oauth_available) {{
+      oauthBlock.hidden = false;
+      manualBlock.hidden = true;
+    }} else {{
+      oauthBlock.hidden = true;
+      manualBlock.hidden = false;
+    }}
   }}
+
+  document.getElementById('oauth-connect-btn').addEventListener('click', () => {{
+    const shop = oauthShopInput.value.trim();
+    if (!shop) {{
+      shopifyStatusMsg.textContent = 'Enter your store domain first.';
+      shopifyStatusMsg.className = 'err';
+      return;
+    }}
+    location.href = '/auth/shopify/install?shop=' + encodeURIComponent(shop);
+  }});
+
+  document.getElementById('show-manual-btn').addEventListener('click', () => {{
+    oauthBlock.hidden = true;
+    manualBlock.hidden = false;
+  }});
 
   document.getElementById('shopify-save-btn').addEventListener('click', async () => {{
     const storeUrl = shopUrlInput.value.trim();

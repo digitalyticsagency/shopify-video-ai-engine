@@ -7,6 +7,10 @@ class Settings(BaseSettings):
 
     SHOPIFY_STORE_URL: str = ""
     SHOPIFY_ACCESS_TOKEN: str = ""
+    SHOPIFY_CLIENT_ID: str = ""
+    SHOPIFY_CLIENT_SECRET: str = ""
+    SHOPIFY_APP_URL: str = ""
+    SHOPIFY_SCOPES: str = "read_products"
     GEMINI_API_KEY: str = ""
     OUTPUT_DIR: str = "./generated_videos"
 
