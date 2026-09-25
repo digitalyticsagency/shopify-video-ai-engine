@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: shopify-video-ai-engine
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: SHOPIFY_STORE_URL
+        sync: false
+      - key: SHOPIFY_ACCESS_TOKEN
+        sync: false
+      - key: SHOPIFY_CLIENT_ID
+        sync: false
+      - key: SHOPIFY_CLIENT_SECRET
+        sync: false
+      - key: SHOPIFY_APP_URL
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
