@@ -10,7 +10,7 @@ from shopify_client import ShopifyProduct
 
 logger = logging.getLogger(__name__)
 
-MODEL_NAME = "gemini-1.1-flash"
+MODEL_NAME = "gemini-3.5-flash-lite"
 
 
 class AnimationStyle(str, Enum):
